@@ -1,4 +1,4 @@
-package com.mc88.browser88;
+package com.ctoa.browser88;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
