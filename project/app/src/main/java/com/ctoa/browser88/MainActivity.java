@@ -11,8 +11,8 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.Base64;
-import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -30,7 +30,6 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
-import android.widget.LinearLayout;
 import android.widget.Toast;
 
 import org.json.JSONArray;
@@ -73,12 +72,10 @@ public class MainActivity extends Activity {
         "[class*='taboola'],[class*='outbrain']{display:none!important}";
 
     private FrameLayout root;
-    private LinearLayout column;
-    private WebView topShell;
     private WebView contentView;
-    private WebView dockShell;
+    private ShellWebView shellView;
 
-    private boolean dockExpanded = false;
+    private boolean sheetOpen = false;
     private boolean adBlockEnabled = true;
     private int blockedCount = 0;
 
@@ -93,47 +90,52 @@ public class MainActivity extends Activity {
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.parseColor("#0e0e10"));
 
-        column = new LinearLayout(this);
-        column.setOrientation(LinearLayout.VERTICAL);
-        column.setBackgroundColor(Color.parseColor("#0e0e10"));
-
-        topShell = new WebView(this);
-        configureWebView(topShell, false);
-        topShell.addJavascriptInterface(new Bridge(), "AndroidBridge");
-        topShell.loadUrl("file:///android_asset/index.html");
-
+        /* Content WebView — bottom layer, loads real websites */
         contentView = new WebView(this);
         configureWebView(contentView, false);
         contentView.addJavascriptInterface(new Bridge(), "AndroidBridge");
         setupContentClient();
         contentView.loadUrl("file:///android_asset/home.html");
-
-        dockShell = new WebView(this);
-        configureWebView(dockShell, true);
-        dockShell.addJavascriptInterface(new Bridge(), "AndroidBridge");
-        dockShell.loadUrl("file:///android_asset/dock.html");
-
-        column.addView(topShell, new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(60)));
-        column.addView(contentView, new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-
-        View spacer = new View(this);
-        column.addView(spacer, new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(64)));
-
-        root.addView(column, new FrameLayout.LayoutParams(
+        root.addView(contentView, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT));
 
-        FrameLayout.LayoutParams dockLp = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(64));
-        dockLp.gravity = Gravity.BOTTOM;
-        root.addView(dockShell, dockLp);
+        /* Shell WebView — top layer, transparent, draws top + dock + sheets */
+        shellView = new ShellWebView(this);
+        configureWebView(shellView, true);
+        shellView.addJavascriptInterface(new Bridge(), "AndroidBridge");
+        shellView.loadUrl("file:///android_asset/index.html");
+        root.addView(shellView, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT));
 
         setContentView(root);
-
         requestRuntimePermissions();
+    }
+
+    /* ============================================================
+       ShellWebView — passes touches through the middle to content
+       ============================================================ */
+    private class ShellWebView extends WebView {
+        public ShellWebView(Activity ctx){ super(ctx); }
+
+        @Override
+        public boolean dispatchTouchEvent(MotionEvent ev){
+            /* If a sheet is open, the shell handles all touches */
+            if(sheetOpen) return super.dispatchTouchEvent(ev);
+
+            /* Otherwise, only the top bar and dock areas are interactive */
+            float y = ev.getY();
+            float h = getHeight();
+            float topPx = dp(60);
+            float dockPx = dp(64);
+
+            if(y < topPx || y > h - dockPx){
+                return super.dispatchTouchEvent(ev);
+            }
+            /* Middle of the screen — let the content WebView below handle it */
+            return false;
+        }
     }
 
     private int dp(int v){
@@ -161,7 +163,7 @@ public class MainActivity extends Activity {
         s.setJavaScriptCanOpenWindowsAutomatically(true);
         s.setSupportMultipleWindows(false);
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP){
             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true);
         }
         CookieManager.getInstance().setAcceptCookie(true);
@@ -183,20 +185,23 @@ public class MainActivity extends Activity {
         return false;
     }
 
+    /* ============================================================
+       CONTENT CLIENT
+       ============================================================ */
     private void setupContentClient(){
 
         contentView.setWebChromeClient(new WebChromeClient() {
 
             @Override
             public void onProgressChanged(WebView v, int p){
-                callTopBool("shellSetProgress", p < 100);
+                callShellBool("shellSetProgress", p < 100);
             }
 
             @Override
             public void onReceivedTitle(WebView v, String title){
                 String url = v.getUrl();
                 if(url != null && !url.startsWith("file://")){
-                    dockCall("dockOnPageLoaded",
+                    callShellTwo("shellOnPageLoaded",
                         jsStr(url),
                         jsStr(title != null ? title : ""));
                 }
@@ -204,12 +209,12 @@ public class MainActivity extends Activity {
 
             @Override
             public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb, FileChooserParams params){
-                if (filePathCallback != null) filePathCallback.onReceiveValue(null);
+                if(filePathCallback != null) filePathCallback.onReceiveValue(null);
                 filePathCallback = cb;
                 try {
                     startActivityForResult(params.createIntent(), REQ_FILE_CHOOSER);
                     return true;
-                } catch (Exception e){
+                } catch(Exception e){
                     filePathCallback = null;
                     return false;
                 }
@@ -220,7 +225,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(new Runnable(){
                     @Override public void run(){
                         try { request.grant(request.getResources()); }
-                        catch (Exception e) { request.deny(); }
+                        catch(Exception e){ request.deny(); }
                     }
                 });
             }
@@ -267,7 +272,7 @@ public class MainActivity extends Activity {
                     if(u != null && isAdHost(u.getHost())){
                         blockedCount++;
                         if(blockedCount % 5 == 0){
-                            dockCall("dockSetBlocked", String.valueOf(blockedCount));
+                            callShellStr("shellSetBlocked", String.valueOf(blockedCount));
                         }
                         return new WebResourceResponse(
                             "text/plain", "utf-8",
@@ -281,12 +286,12 @@ public class MainActivity extends Activity {
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r){
                 Uri uri = r.getUrl();
                 String scheme = uri.getScheme();
-                if (!"http".equals(scheme) && !"https".equals(scheme)
+                if(!"http".equals(scheme) && !"https".equals(scheme)
                         && !"file".equals(scheme)){
                     try {
                         startActivity(new Intent(Intent.ACTION_VIEW, uri));
                         return true;
-                    } catch (Exception e){ return false; }
+                    } catch(Exception e){ return false; }
                 }
                 return false;
             }
@@ -295,9 +300,9 @@ public class MainActivity extends Activity {
             public void onPageStarted(WebView v, String url, android.graphics.Bitmap f){
                 if(url == null) return;
                 if(url.startsWith("file://") && url.contains("home.html")){
-                    callTopStr("shellSetUrl", "");
+                    callShellStr("shellSetUrl", "");
                 } else if(!url.startsWith("file://")){
-                    callTopStr("shellSetUrl", url);
+                    callShellStr("shellSetUrl", url);
                 }
                 updateNavState();
             }
@@ -332,48 +337,49 @@ public class MainActivity extends Activity {
     private void updateNavState(){
         boolean cb = contentView.canGoBack();
         boolean cf = contentView.canGoForward();
-        dockCall("dockSetNavState",
+        callShellTwo("shellSetNav",
             String.valueOf(cb),
             String.valueOf(cf));
     }
 
-    private void callTopStr(String fn, String arg){
+    /* ============================================================
+       SHELL CALLBACK HELPERS
+       ============================================================ */
+    private void callShellStr(String fn, String arg){
+        final String f = fn;
+        final String a = arg;
         runOnUiThread(new Runnable(){
             @Override public void run(){
                 try {
-                    topShell.evaluateJavascript(
-                        "window." + fn + "(" + jsStr(arg) + ");", null);
-                } catch (Exception ignored){}
+                    shellView.evaluateJavascript(
+                        "window." + f + "(" + jsStr(a) + ");", null);
+                } catch(Exception ignored){}
             }
         });
     }
 
-    private void callTopBool(String fn, final boolean arg){
+    private void callShellBool(String fn, final boolean arg){
+        final String f = fn;
         runOnUiThread(new Runnable(){
             @Override public void run(){
                 try {
-                    topShell.evaluateJavascript(
-                        "window." + fn + "(" + arg + ");", null);
-                } catch (Exception ignored){}
+                    shellView.evaluateJavascript(
+                        "window." + f + "(" + arg + ");", null);
+                } catch(Exception ignored){}
             }
         });
     }
 
-    private void dockCall(String fn, String... args){
-        final String fnFinal = fn;
-        final String[] argsFinal = args;
+    private void callShellTwo(String fn, String a, String b){
+        final String f = fn;
+        final String arg1 = a;
+        final String arg2 = b;
         runOnUiThread(new Runnable(){
             @Override public void run(){
                 try {
-                    StringBuilder sb = new StringBuilder("window.");
-                    sb.append(fnFinal).append("(");
-                    for(int i = 0; i < argsFinal.length; i++){
-                        if(i > 0) sb.append(",");
-                        sb.append(argsFinal[i]);
-                    }
-                    sb.append(");");
-                    dockShell.evaluateJavascript(sb.toString(), null);
-                } catch (Exception ignored){}
+                    shellView.evaluateJavascript(
+                        "window." + f + "(" + arg1 + "," + arg2 + ");", null);
+                } catch(Exception ignored){}
             }
         });
     }
@@ -386,33 +392,9 @@ public class MainActivity extends Activity {
                         .replace("\r", "") + "\"";
     }
 
-    private void expandDock(){
-        if(dockExpanded) return;
-        runOnUiThread(new Runnable(){
-            @Override public void run(){
-                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT);
-                dockShell.setLayoutParams(lp);
-                dockShell.bringToFront();
-                dockExpanded = true;
-            }
-        });
-    }
-
-    private void collapseDock(){
-        if(!dockExpanded) return;
-        runOnUiThread(new Runnable(){
-            @Override public void run(){
-                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, dp(64));
-                lp.gravity = Gravity.BOTTOM;
-                dockShell.setLayoutParams(lp);
-                dockExpanded = false;
-            }
-        });
-    }
-
+    /* ============================================================
+       BRIDGE — everything the shell and content can call
+       ============================================================ */
     public class Bridge {
 
         @JavascriptInterface
@@ -470,24 +452,9 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public void toggleMenu(){
-            runOnUiThread(new Runnable(){
-                @Override public void run(){
-                    expandDock();
-                    dockShell.postDelayed(new Runnable(){
-                        @Override public void run(){
-                            dockCall("dockOpenMenu");
-                        }
-                    }, 80);
-                }
-            });
+        public void setSheetOpen(final boolean open){
+            sheetOpen = open;
         }
-
-        @JavascriptInterface
-        public void expandDock(){ MainActivity.this.expandDock(); }
-
-        @JavascriptInterface
-        public void collapseDock(){ MainActivity.this.collapseDock(); }
 
         @JavascriptInterface
         public void setAdblock(final boolean on){
@@ -560,7 +527,7 @@ public class MainActivity extends Activity {
                         if(cur != null && cur.contains("home.html")){
                             contentView.reload();
                         }
-                    } catch (Exception e){
+                    } catch(Exception e){
                         Toast.makeText(MainActivity.this, "Pin failed", Toast.LENGTH_SHORT).show();
                     }
                 }
@@ -572,7 +539,7 @@ public class MainActivity extends Activity {
             try {
                 SharedPreferences sp = getSharedPreferences("b88.pins", MODE_PRIVATE);
                 return sp.getString("list", "[]");
-            } catch (Exception e){
+            } catch(Exception e){
                 return "[]";
             }
         }
@@ -593,7 +560,7 @@ public class MainActivity extends Activity {
                 @Override public void run(){
                     try {
                         startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-                    } catch (Exception ignored){}
+                    } catch(Exception ignored){}
                 }
             });
         }
@@ -613,7 +580,7 @@ public class MainActivity extends Activity {
                         fos.close();
                         Toast.makeText(MainActivity.this,
                             "Saved: " + filename, Toast.LENGTH_LONG).show();
-                    } catch (Exception e){
+                    } catch(Exception e){
                         Toast.makeText(MainActivity.this,
                             "Save failed", Toast.LENGTH_SHORT).show();
                     }
@@ -622,6 +589,9 @@ public class MainActivity extends Activity {
         }
     }
 
+    /* ============================================================
+       FILE CHOOSER RESULT
+       ============================================================ */
     @Override
     protected void onActivityResult(int req, int res, Intent data){
         if(req == REQ_FILE_CHOOSER){
@@ -645,6 +615,9 @@ public class MainActivity extends Activity {
         super.onActivityResult(req, res, data);
     }
 
+    /* ============================================================
+       PERMISSIONS
+       ============================================================ */
     private void requestRuntimePermissions(){
         List<String> needed = new ArrayList<>();
         if(Build.VERSION.SDK_INT >= 33){
@@ -669,14 +642,16 @@ public class MainActivity extends Activity {
         return checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED;
     }
 
+    /* ============================================================
+       BACK BUTTON
+       ============================================================ */
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event){
         if(keyCode == KeyEvent.KEYCODE_BACK){
-            if(dockExpanded){
-                dockShell.evaluateJavascript(
+            if(sheetOpen){
+                shellView.evaluateJavascript(
                     "(function(){var s=document.getElementById('scrim');" +
-                    "if(s&&s.classList.contains('on'))s.click();})();", null);
-                collapseDock();
+                    "if(s)s.click();})();", null);
                 return true;
             }
             String url = contentView.getUrl();
@@ -692,27 +667,19 @@ public class MainActivity extends Activity {
         return super.onKeyDown(keyCode, event);
     }
 
-    @Override
-    protected void onPause(){
+    @Override protected void onPause(){
         super.onPause();
-        if(topShell != null) topShell.onPause();
         if(contentView != null) contentView.onPause();
-        if(dockShell != null) dockShell.onPause();
+        if(shellView != null) shellView.onPause();
     }
-
-    @Override
-    protected void onResume(){
+    @Override protected void onResume(){
         super.onResume();
-        if(topShell != null) topShell.onResume();
         if(contentView != null) contentView.onResume();
-        if(dockShell != null) dockShell.onResume();
+        if(shellView != null) shellView.onResume();
     }
-
-    @Override
-    protected void onDestroy(){
-        if(topShell != null){ topShell.destroy(); topShell = null; }
+    @Override protected void onDestroy(){
         if(contentView != null){ contentView.destroy(); contentView = null; }
-        if(dockShell != null){ dockShell.destroy(); dockShell = null; }
+        if(shellView != null){ shellView.destroy(); shellView = null; }
         super.onDestroy();
     }
-                }
+                               }
